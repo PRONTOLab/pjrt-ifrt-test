@@ -5,8 +5,15 @@
 #include "mlir/CAPI/Support.h"
 
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
-#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMIRToLLVMTranslation.h"
-#include "mlir/Target/LLVMIR/Dialect/NVVM/LLVMIRToNVVMTranslation.h"
+// #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMIRToLLVMTranslation.h"
+// #include "mlir/Target/LLVMIR/Dialect/NVVM/LLVMIRToNVVMTranslation.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+
+#include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
+#include "stablehlo/dialect/ChloOps.h"
+#include "stablehlo/dialect/StablehloOps.h"
 
 // #include "Enzyme/MLIR/Dialect/Dialect.h"
 // #include "Enzyme/MLIR/Dialect/Ops.h"
@@ -19,8 +26,36 @@
 #include "xla/pjrt/pjrt_c_api_client.h"
 #include "xla/pjrt/pjrt_executable.h"
 
+#include "xla/python/ifrt/hlo/hlo_program.h"
+
 using namespace xla;
 using namespace mlir;
+
+// Julia is row-major (like Fortran) and 1-indexed.
+// https://openxla.org/xla/shapes
+// This minor-to-major dimension order of 0 up to N-1 is akin to column-major
+// (at rank 2). Assuming a monotonic ordering of dimensions, another way we may
+// refer to this layout in the code is simply "dim 0 is minor".
+std::vector<int64_t> col_major(int64_t dim)
+{
+    std::vector<int64_t> minor_to_major;
+    for (int i = 0; i < dim; i++)
+    {
+        minor_to_major.push_back(i); // dim-1-i);
+                                     // minor_to_major.push_back(dim-1-i);
+    }
+    return minor_to_major;
+}
+
+std::vector<int64_t> row_major(int64_t dim)
+{
+    std::vector<int64_t> minor_to_major;
+    for (int i = 0; i < dim; i++)
+    {
+        minor_to_major.push_back(dim - 1 - i);
+    }
+    return minor_to_major;
+}
 
 // This is set by Reactant.jl on startup to allow throwing errors back to Julia.
 extern "C" extern void (*ReactantThrowError)(const char *) = nullptr;
@@ -44,35 +79,35 @@ T MyValueOrThrow(absl::StatusOr<T> v)
     }
 }
 
-void prepareRegistry(mlir::DialectRegistry &registry);
+// void prepareRegistry(mlir::DialectRegistry &registry);
 
 // Initializes the MLIR registry and passes.
 extern "C" void InitializeRegistryAndPasses(MlirDialectRegistry creg)
 {
     mlir::DialectRegistry &registry = *unwrap(creg);
-    prepareRegistry(registry);
+    // prepareRegistry(registry);
 
     // mlir::registerenzymePasses();
     // registerenzymexlaPasses();
 
     // Register the standard passes we want.
-    mlir::registerCSEPass();
-    mlir::registerConvertAffineToStandardPass();
-    mlir::registerSCCPPass();
-    mlir::registerInlinerPass();
-    mlir::registerCanonicalizerPass();
-    mlir::registerSymbolDCEPass();
-    mlir::registerLoopInvariantCodeMotionPass();
+    // mlir::registerCSEPass();
+    // mlir::registerConvertAffineToStandardPass();
+    // mlir::registerSCCPPass();
+    // mlir::registerInlinerPass();
+    // mlir::registerCanonicalizerPass();
+    // mlir::registerSymbolDCEPass();
+    // mlir::registerLoopInvariantCodeMotionPass();
     // mlir::registerConvertSCFToOpenMPPass();
     // mlir::affine::registerAffinePasses();
-    mlir::registerReconcileUnrealizedCasts();
+    // mlir::registerReconcileUnrealizedCasts();
 
-    mlir::registerLLVMDialectImport(registry);
+    // mlir::registerLLVMDialectImport(registry);
     // mlir::registerNVVMDialectImport(registry);
     mlir::LLVM::registerInlinerInterface(registry);
 
     // Transform dialect and extensions.
-    mlir::transform::registerInterpreterPass();
+    // mlir::transform::registerInterpreterPass();
     // mlir::enzyme::registerGenerateApplyPatternsPass();
     // mlir::enzyme::registerRemoveTransformPass();
 }
@@ -95,7 +130,7 @@ extern "C" void RegisterDialects(MlirContext cctx)
 {
     mlir::MLIRContext &context = *unwrap(cctx);
     DialectRegistry registry;
-    prepareRegistry(registry);
+    // prepareRegistry(registry);
     context.appendDialectRegistry(registry);
     context.loadDialect<mlir::arith::ArithDialect>();
     // context.loadDialect<mlir::enzyme::EnzymeDialect>();
@@ -233,7 +268,7 @@ extern "C" void FreeClient(PjRtClient *client) { delete client; }
 int main()
 {
     // 1. init MLIR registry and passes
-    MlirDialectRegistry registry = MlirDialectRegistryCreate();
+    MlirDialectRegistry registry = mlirDialectRegistryCreate();
     InitializeRegistryAndPasses(registry);
 
     // 2. init PjRt client (CPU)
@@ -245,19 +280,17 @@ int main()
     // 3. parse MLIR
     MlirContext mlir_ctx = mlirContextCreateWithRegistry(registry, false);
     RegisterDialects(mlir_ctx);
-    const char *mlir_code = "
-        module
-    {
-        func.func @main(% arg0 : tensor<4x4xf64>)->tensor<4x4xf64>
-        {
-            % 0 = stablehlo.sine % arg0 : tensor<4x4xf64> return % 0 : tensor<4x4xf64>
-        }
-    }
-    ";
-        MlirModule mlir_mod = mlirModuleCreateParse(mlir_code, registry);
+    const char *mlir_code_cstr =
+        "module {\n"
+        "func.func @main(\%arg0 : tensor<4x4xf64>)->tensor<4x4xf64> {\n"
+        "    \%0 = stablehlo.sine \%arg0 : tensor<4x4xf64> return \%0 : tensor<4x4xf64>\n"
+        "}\n"
+        "}\n\0";
+    MlirStringRef mlir_code = mlirStringRefCreateFromCString(mlir_code_cstr);
+    MlirModule mlir_mod = mlirModuleCreateParse(mlir_ctx, mlir_code);
 
     // 4. compile MLIR module to XLA executable
-    xla::PjRtLoadedExecutable *loaded_exec = ClientCompile(client, mlir_code);
+    xla::PjRtLoadedExecutable *loaded_exec = ClientCompile(client, mlir_mod);
 
     // 5. create input array
     float64_t *ptr = new float64_t[16];
@@ -272,7 +305,7 @@ int main()
     int default_device_idx = 0;
     xla::PjRtDevice *device = ClientGetDevice(client, default_device_idx);
 
-    xla::PjRtBuffer *buffer = ArrayFromHostBuffer(client, ptr, prim_type, dim, &shape, device);
+    xla::PjRtBuffer *buffer = ArrayFromHostBuffer(client, ptr, prim_type, dim, shape, device);
 
     // 6. execute computation
     int num_args = 1;
@@ -283,7 +316,7 @@ int main()
     int num_results = 1;
     PjRtBuffer **op_results = new PjRtBuffer *[num_results];
     uint8_t futures;
-    PjRtFuture **future_results = new PjRtFuture *[num_results];
+    PjRtFuture<> **future_results = new PjRtFuture<> *[num_results];
     XLAExecute(loaded_exec, num_args, op_args, is_arg_donatable, num_results, op_results, &futures, future_results);
 
     // 7. print results
