@@ -282,6 +282,120 @@ extern "C" void BufferToHost(PjRtBuffer *buffer, void *data)
 
 extern "C" void FreeClient(PjRtClient *client) { delete client; }
 
+namespace reactant {
+
+template <typename T> struct unwrap_type { typedef T type; };
+template <typename T> struct unwrap_type<std::shared_ptr<T>> { typedef T type; };
+template <typename T> struct unwrap_type<tsl::RCReference<T>> { typedef T type; };
+
+template <typename T> using unwrap_type_t = typename unwrap_type<T>::type;
+
+template<typename T>
+struct Holded {
+ public:
+    Holded(T& obj) : holded(obj) {}
+    ~Holded() = default;
+
+    unwrap_type_t<T>* ptr() const {
+        return holded.get();
+    }
+
+    T obj() const {
+        return holded;
+    }
+
+    T value() const {
+        return holded;
+    }
+
+    unwrap_type_t<T>* operator->() const {
+        return ptr();
+    }
+
+ private:
+    T holded;
+};
+
+template <typename T>
+Holded<T>* capture(T obj) {
+    return new Holded<T>(obj);
+}
+
+} // namespace reactant
+
+using reactant::Holded;
+
+extern "C" Holded<std::shared_ptr<PjRtClient>>* reactant_hold_pjrtclient(xla::PjRtClient* client) {
+  return reactant::capture(std::shared_ptr<PjRtClient>(client));
+}
+
+extern "C" void reactant_release_pjrtclient(Holded<std::shared_ptr<PjRtClient>>* client) { delete client; }
+
+extern "C" Holded<std::shared_ptr<xla::PjRtBuffer>>* reactant_hold_pjrtbuffer(xla::PjRtBuffer* buffer) {
+  return reactant::capture(std::shared_ptr<xla::PjRtBuffer>(buffer));
+}
+
+extern "C" void reactant_release_pjrtbuffer(Holded<std::shared_ptr<PjRtBuffer>>* buffer) { delete buffer; }
+
+extern "C" ifrt::PjRtClient* MakeIFRTPJRTClient(Holded<std::shared_ptr<PjRtClient>>* pjrt_client) {
+  xla::ifrt::PjRtClient::CreateOptions options = {pjrt_client->obj()};
+  return MyValueOrThrow(xla::ifrt::PjRtClient::Create(options)).release();
+}
+
+extern "C" void FreeIFRTPJRTClient(ifrt::PjRtClient* client) { delete client; }
+
+extern "C" xla::ifrt::LoadedExecutable* IFRTPJRT_ClientCompile(ifrt::PjRtClient* client, MlirModule mlir_mod) {
+  mlir::ModuleOp mlir_mod_op = cast<ModuleOp>(*unwrap(mlir_mod));
+  // TODO import sharding config from `ClientCompile`?
+  xla::CompileOptions compile_options;
+  // TODO can't create LoadedExecutable from mlir::ModuleOp on IFRT-proxy backend
+  return MyValueOrThrow(xla::ifrt::PjRtLoadedExecutable::Create(client, mlir_mod_op, compile_options, std::vector<tsl::RCReference<xla::ifrt::LoadedHostCallback>>())).release();
+}
+
+extern "C" void FreeLoadedExecutableIFRTPJRT(xla::ifrt::PjRtLoadedExecutable* exec) { delete exec; }
+
+extern "C" Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* ArrayFromHostBufferIFRTPJRT(ifrt::PjRtClient* client, Holded<std::shared_ptr<xla::PjRtBuffer>>* buffer) {
+  return reactant::capture(MyValueOrThrow(xla::ifrt::PjRtArray::Create(client, buffer->obj())));
+}
+
+extern "C" void reactant_release_ifrt_pjrt_array(Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* array) { delete array; }
+
+extern "C" void IFRT_Execute(ifrt::LoadedExecutable* exec, int num_args, Holded<tsl::RCReference<ifrt::Array>>** op_args, uint8_t* is_arg_donatable, int num_results, Holded<tsl::RCReference<ifrt::Array>>** op_results, uint8_t *futures, PjRtFuture<>** status) {
+  std::vector<tsl::RCReference<xla::ifrt::Array>> args;
+  for (int i = 0; i < num_args; i++) {
+    args.emplace_back(op_args[i]->obj());
+  }
+
+  ifrt::ExecuteOptions options;
+  for (size_t i = 0; i < num_args; i++) {
+    if (!is_arg_donatable[i]) {
+      options.non_donatable_input_indices.insert(static_cast<int>(i));
+    }
+  }
+  options.fill_status = true;
+
+  auto result = MyValueOrThrow(exec->Execute(static_cast<absl::Span<tsl::RCReference<xla::ifrt::Array>>>(args), options, /* devices */ std::nullopt));
+
+  if (result.outputs.size() != num_results) {
+    llvm::errs() << "Error: results.size()=" << result.outputs.size()
+                 << " does not match num_results=" << num_results << "\n";
+    std::abort(); // Terminate if the number of results is incorrect.
+  }
+
+  // there is only 1 status and is valid because we set `options.fill_status = true`
+  *futures = true;
+  *status = new PjRtFuture<>(result.status);
+
+  for (int i = 0; i < num_results; i++) {
+    op_results[i] = reactant::capture(result.outputs[i]);
+  }
+}
+
+// in principle, use ArrayCopySemantics::kAlwaysCopy (=0)
+extern "C" PjRtFuture<>* IFRT_Array_CopyToHostBuffer(Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* array, void* data, ifrt::ArrayCopySemantics semantics) {
+  (*array)->CopyToHostBuffer(data, std::nullopt, semantics);
+}
+
 int main()
 {
     // 1. init MLIR registry and passes
@@ -292,10 +406,13 @@ int main()
     uint8_t async = false;
     int node_id = 0;
     int num_nodes = 1;
-    auto pjrt_client = std::shared_ptr<xla::PjRtClient>(MakeCPUClient(async, node_id, num_nodes));
+    // auto pjrt_client = std::shared_ptr<xla::PjRtClient>(MakeCPUClient(async, node_id, num_nodes));
+    xla::PjRtClient* pjrt_client = MakeCPUClient(async, node_id, num_nodes);
+    Holded<std::shared_ptr<xla::PjRtClient>>* pjrt_client_holded = reactant_hold_pjrtclient(pjrt_client);
     
-    xla::ifrt::PjRtClient::CreateOptions options = {pjrt_client};
-    xla::ifrt::PjRtClient* ifrt_client = MyValueOrThrow(xla::ifrt::PjRtClient::Create(options)).release();
+    // xla::ifrt::PjRtClient::CreateOptions options = {pjrt_client};
+    // xla::ifrt::PjRtClient* ifrt_client = MyValueOrThrow(xla::ifrt::PjRtClient::Create(options)).release();
+    xla::ifrt::PjRtClient* ifrt_client = MakeIFRTPJRTClient(pjrt_client_holded);
 
     // 3. parse MLIR
     MlirContext mlir_ctx = mlirContextCreateWithRegistry(registry, false);
@@ -308,11 +425,14 @@ int main()
         "}\n\0";
     MlirStringRef mlir_code = mlirStringRefCreateFromCString(mlir_code_cstr);
     MlirModule mlir_mod = mlirModuleCreateParse(mlir_ctx, mlir_code);
-    mlir::ModuleOp mlir_mod_op = cast<ModuleOp>(*unwrap(mlir_mod));
+    // mlir::ModuleOp mlir_mod_op = cast<ModuleOp>(*unwrap(mlir_mod));
 
     // 4. compile MLIR module to XLA executable
-    xla::CompileOptions compile_options;
-    xla::ifrt::LoadedExecutable *loaded_exec = MyValueOrThrow(xla::ifrt::PjRtLoadedExecutable::Create(ifrt_client, mlir_mod_op, compile_options, std::vector<tsl::RCReference<xla::ifrt::LoadedHostCallback>>())).release();
+    // xla::CompileOptions compile_options;
+    // xla::ifrt::LoadedExecutable *loaded_exec = MyValueOrThrow(xla::ifrt::PjRtLoadedExecutable::Create(ifrt_client, mlir_mod_op, compile_options, std::vector<tsl::RCReference<xla::ifrt::LoadedHostCallback>>())).release();
+    /* auto program = std::make_unique<xla::ifrt::HloProgram>(mlir_mod_op);
+       xla::ifrt::LoadedExecutable *loaded_exec = MyValueOrThrow(ifrt_client->GetDefaultCompiler()->Compile(program, compile_options)).release(); */
+    ifrt::LoadedExecutable* loaded_exec = IFRTPJRT_ClientCompile(ifrt_client, mlir_mod);
 
     // 5. create input array (use single-shard for now)
     double *ptr = new double[16];
@@ -325,25 +445,35 @@ int main()
     }
 
     int default_device_idx = 0;
-    xla::PjRtDevice *device = ClientGetDevice(pjrt_client.get(), default_device_idx);
-    auto buffer = std::shared_ptr<xla::PjRtBuffer>(ArrayFromHostBuffer(pjrt_client.get(), ptr, prim_type, dim, shape, device));
-    tsl::RCReference<xla::ifrt::PjRtArray> ifrt_input_array = MyValueOrThrow(xla::ifrt::PjRtArray::Create(ifrt_client, buffer));
+    xla::PjRtDevice *device = ClientGetDevice(pjrt_client, default_device_idx);
+    auto buffer = ArrayFromHostBuffer(pjrt_client, ptr, prim_type, dim, shape, device);
+
+    Holded<std::shared_ptr<xla::PjRtBuffer>>* buffer_holded = reactant_hold_pjrtbuffer(buffer);
+    Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* ifrt_input_array = ArrayFromHostBufferIFRTPJRT(ifrt_client, buffer_holded);
 
     // 6. execute computation
-    std::vector<tsl::RCReference<xla::ifrt::Array>> args;
-    args.emplace_back(ifrt_input_array);
+    // std::vector<tsl::RCReference<xla::ifrt::Array>> args;
+    // args.emplace_back(ifrt_input_array);
 
-    xla::ifrt::ExecuteOptions exec_options;
-    xla::ifrt::LoadedExecutable::ExecuteResult result = MyValueOrThrow(loaded_exec->Execute(static_cast<absl::Span<tsl::RCReference<xla::ifrt::Array>>>(args), exec_options, /* devices */ std::nullopt));
+    // xla::ifrt::ExecuteOptions exec_options;
+    // xla::ifrt::LoadedExecutable::ExecuteResult result = MyValueOrThrow(loaded_exec->Execute(static_cast<absl::Span<tsl::RCReference<xla::ifrt::Array>>>(args), exec_options, /* devices */ std::nullopt));
 
-    // sync: block until done
-    // using namespace std::chrono_literals;
-    // std::this_thread::sleep_for(2000ms);
+    int num_args = 1;
+    int num_results = 1;
+    uint8_t is_arg_donatable[1] = {false};
+    uint8_t futures = false;
+    PjRtFuture<>** status = new PjRtFuture<>*[1];
+    Holded<tsl::RCReference<ifrt::Array>>** op_args = new Holded<tsl::RCReference<ifrt::Array>>*[num_args];
+    Holded<tsl::RCReference<ifrt::Array>>** op_results = new Holded<tsl::RCReference<ifrt::Array>>*[num_results];
+
+    op_args[0] = (Holded<tsl::RCReference<ifrt::Array>>*)ifrt_input_array;
+
+    IFRT_Execute(loaded_exec, num_args, op_args, is_arg_donatable, num_results, op_results, &futures, status);
 
     // 7. print results
     double *ptr_result = new double[16];
     // BufferToHost(result.outputs[0]->pjrt_buffers()[0].get(), ptr_result);
-    result.outputs[0]->CopyToHostBuffer(ptr_result, std::nullopt, xla::ifrt::ArrayCopySemantics::kAlwaysCopy);
+    (*op_results[0])->CopyToHostBuffer(ptr_result, std::nullopt, xla::ifrt::ArrayCopySemantics::kAlwaysCopy);
 
     for (int i = 0; i < 16; i++)
     {
@@ -353,7 +483,15 @@ int main()
     // 8. free memory
     delete loaded_exec;
     delete ifrt_client;
-    // FreeClient(client);
-    // delete[] ptr;
-    // delete[] ptr_result;
+
+    // first release holded value and then raw pointer
+    reactant_release_pjrtclient(pjrt_client_holded);
+    delete pjrt_client;
+
+    reactant_release_ifrt_pjrt_array(ifrt_input_array);
+    reactant_release_pjrtbuffer(buffer_holded);
+    delete buffer;
+
+    delete[] ptr;
+    delete[] ptr_result;
 }
