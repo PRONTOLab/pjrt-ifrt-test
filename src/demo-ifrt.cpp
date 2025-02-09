@@ -280,6 +280,8 @@ extern "C" void BufferToHost(PjRtBuffer *buffer, void *data)
     }
 }
 
+extern "C" void PjRtBufferFree(PjRtBuffer *Buffer) { delete Buffer; }
+
 extern "C" void FreeClient(PjRtClient *client) { delete client; }
 
 namespace reactant {
@@ -481,17 +483,22 @@ int main()
     }
 
     // 8. free memory
+    delete[] ptr;
+    delete[] ptr_result;
+    delete[] op_args;
+    delete[] op_results;
+    delete[] status;
+
     delete loaded_exec;
     delete ifrt_client;
 
-    // first release holded value and then raw pointer
-    reactant_release_pjrtclient(pjrt_client_holded);
-    delete pjrt_client;
-
     reactant_release_ifrt_pjrt_array(ifrt_input_array);
     reactant_release_pjrtbuffer(buffer_holded);
-    delete buffer;
 
-    delete[] ptr;
-    delete[] ptr_result;
+    // do not free buffer because it has already been freed on `reactant_release_pjrtbuffer`
+    // PjRtBufferFree(buffer);
+
+    reactant_release_pjrtclient(pjrt_client_holded);
+    // do not free buffer because it has already been freed on `reactant_release_pjrtclient`
+    // delete pjrt_client;
 }
