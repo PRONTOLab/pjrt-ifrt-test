@@ -20,13 +20,25 @@
 // #include "Enzyme/MLIR/Implementations/CoreDialectsAutoDiffImplementations.h"
 // #include "Enzyme/MLIR/Passes/Passes.h"
 
+#include "xla/tsl/concurrency/ref_count.h"
+
 #include "xla/pjrt/status_casters.h"
 #include "xla/pjrt/cpu/cpu_client.h"
 #include "xla/pjrt/pjrt_api.h"
 #include "xla/pjrt/pjrt_c_api_client.h"
 #include "xla/pjrt/pjrt_executable.h"
 
+#include "xla/python/pjrt_ifrt/pjrt_client.h"
+#include "xla/python/pjrt_ifrt/pjrt_array.h"
+#include "xla/python/pjrt_ifrt/pjrt_executable.h"
+#include "xla/python/ifrt/host_callback.h"
+
 #include "xla/python/ifrt/hlo/hlo_program.h"
+
+#include <chrono>
+#include <iostream>
+#include <thread>
+
 
 using namespace xla;
 using namespace mlir;
@@ -58,7 +70,7 @@ std::vector<int64_t> row_major(int64_t dim)
 }
 
 // This is set by Reactant.jl on startup to allow throwing errors back to Julia.
-extern "C" extern void (*ReactantThrowError)(const char *) = nullptr;
+extern "C" void (*ReactantThrowError)(const char *) = nullptr;
 
 // Utilities for `StatusOr`.
 template <typename T>
@@ -125,6 +137,8 @@ extern "C" PjRtClient *MakeCPUClient(uint8_t asynchronous, int node_id, int num_
     return client.release();
 }
 
+
+
 // Registers the MLIR dialects.
 extern "C" void RegisterDialects(MlirContext cctx)
 {
@@ -183,21 +197,24 @@ extern "C" PjRtDevice *ClientGetDevice(PjRtClient *client, int device_id)
 }
 
 // Creates an XLA buffer from a host buffer (i.e. PjRtClient::BufferFromHostBuffer)
-extern "C" PjRtBuffer *ArrayFromHostBuffer(PjRtClient *client, void *data, uint64_t ptype, size_t dim, int64_t *cshape, PjRtDevice *device)
-{
-    auto primtype = (xla::PrimitiveType)ptype;
-    absl::Span<const int64_t> shape(cshape, dim);
-    PjRtClient::HostBufferSemantics semantics =
-        PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall;
-    // xla::Layout layout(col_major(dim));
-    // auto buffer = xla::MyValueOrThrow(client->BufferFromHostBuffer(data,
-    // primtype, shape, /*byte_strides*/{},  semantics, /*ondone*/{}, device,
-    // &layout));
-    auto buffer = MyValueOrThrow(
-        client->BufferFromHostBuffer(data, primtype, shape, /*byte_strides*/ {},
-                                     semantics, /*ondone*/ {}, device));
-    auto bres = buffer.release();
-    return bres;
+extern "C" PjRtBuffer *ArrayFromHostBuffer(PjRtClient *client, void *data,
+                                           uint64_t ptype, size_t dim,
+                                           int64_t *cshape,
+                                           PjRtDevice *device) {
+  auto primtype = (xla::PrimitiveType)ptype;
+  absl::Span<const int64_t> shape(cshape, dim);
+  PjRtClient::HostBufferSemantics semantics =
+      PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall;
+  // xla::Layout layout(col_major(dim));
+  // auto buffer = xla::MyValueOrThrow(client->BufferFromHostBuffer(data,
+  // primtype, shape, /*byte_strides*/{},  semantics, /*ondone*/{}, device,
+  // &layout));
+  const xla::Layout* layout = nullptr;
+  auto buffer = MyValueOrThrow(
+      client->BufferFromHostBuffer(data, primtype, shape, /*byte_strides*/ {},
+                                   semantics, /*ondone*/ {}, *device->default_memory_space(), layout));
+  auto bres = buffer.release();
+  return bres;
 }
 
 // Executes an XLA executable (i.e. PjRtLoadedExecutable::Execute)
@@ -271,11 +288,14 @@ int main()
     MlirDialectRegistry registry = mlirDialectRegistryCreate();
     InitializeRegistryAndPasses(registry);
 
-    // 2. init PjRt client (CPU)
+    // 2. init PjRt client (CPU) & IFRT client from it (PjRt backend)
     uint8_t async = false;
     int node_id = 0;
     int num_nodes = 1;
-    xla::PjRtClient *client = MakeCPUClient(async, node_id, num_nodes);
+    auto pjrt_client = std::shared_ptr<xla::PjRtClient>(MakeCPUClient(async, node_id, num_nodes));
+    
+    xla::ifrt::PjRtClient::CreateOptions options = {pjrt_client};
+    xla::ifrt::PjRtClient* ifrt_client = MyValueOrThrow(xla::ifrt::PjRtClient::Create(options)).release();
 
     // 3. parse MLIR
     MlirContext mlir_ctx = mlirContextCreateWithRegistry(registry, false);
@@ -288,12 +308,14 @@ int main()
         "}\n\0";
     MlirStringRef mlir_code = mlirStringRefCreateFromCString(mlir_code_cstr);
     MlirModule mlir_mod = mlirModuleCreateParse(mlir_ctx, mlir_code);
+    mlir::ModuleOp mlir_mod_op = cast<ModuleOp>(*unwrap(mlir_mod));
 
     // 4. compile MLIR module to XLA executable
-    xla::PjRtLoadedExecutable *loaded_exec = ClientCompile(client, mlir_mod);
+    xla::CompileOptions compile_options;
+    xla::ifrt::LoadedExecutable *loaded_exec = MyValueOrThrow(xla::ifrt::PjRtLoadedExecutable::Create(ifrt_client, mlir_mod_op, compile_options, std::vector<tsl::RCReference<xla::ifrt::LoadedHostCallback>>())).release();
 
-    // 5. create input array
-    float64_t *ptr = new float64_t[16];
+    // 5. create input array (use single-shard for now)
+    double *ptr = new double[16];
     int64_t shape[2] = {4, 4};
     size_t dim = 2;
     uint64_t prim_type = 12; // float64
@@ -303,25 +325,25 @@ int main()
     }
 
     int default_device_idx = 0;
-    xla::PjRtDevice *device = ClientGetDevice(client, default_device_idx);
-
-    xla::PjRtBuffer *buffer = ArrayFromHostBuffer(client, ptr, prim_type, dim, shape, device);
+    xla::PjRtDevice *device = ClientGetDevice(pjrt_client.get(), default_device_idx);
+    auto buffer = std::shared_ptr<xla::PjRtBuffer>(ArrayFromHostBuffer(pjrt_client.get(), ptr, prim_type, dim, shape, device));
+    tsl::RCReference<xla::ifrt::PjRtArray> ifrt_input_array = MyValueOrThrow(xla::ifrt::PjRtArray::Create(ifrt_client, buffer));
 
     // 6. execute computation
-    int num_args = 1;
-    PjRtBuffer **op_args = new PjRtBuffer *[num_args];
-    op_args[0] = buffer;
-    uint8_t *is_arg_donatable = new uint8_t[num_args];
-    is_arg_donatable[0] = false;
-    int num_results = 1;
-    PjRtBuffer **op_results = new PjRtBuffer *[num_results];
-    uint8_t futures;
-    PjRtFuture<> **future_results = new PjRtFuture<> *[num_results];
-    XLAExecute(loaded_exec, num_args, op_args, is_arg_donatable, num_results, op_results, &futures, future_results);
+    std::vector<tsl::RCReference<xla::ifrt::Array>> args;
+    args.emplace_back(ifrt_input_array);
+
+    xla::ifrt::ExecuteOptions exec_options;
+    xla::ifrt::LoadedExecutable::ExecuteResult result = MyValueOrThrow(loaded_exec->Execute(static_cast<absl::Span<tsl::RCReference<xla::ifrt::Array>>>(args), exec_options, /* devices */ std::nullopt));
+
+    // sync: block until done
+    // using namespace std::chrono_literals;
+    // std::this_thread::sleep_for(2000ms);
 
     // 7. print results
-    float64_t *ptr_result = new float64_t[16];
-    BufferToHost(op_results[0], ptr_result);
+    double *ptr_result = new double[16];
+    // BufferToHost(result.outputs[0]->pjrt_buffers()[0].get(), ptr_result);
+    result.outputs[0]->CopyToHostBuffer(ptr_result, std::nullopt, xla::ifrt::ArrayCopySemantics::kAlwaysCopy);
 
     for (int i = 0; i < 16; i++)
     {
@@ -329,7 +351,9 @@ int main()
     }
 
     // 8. free memory
-    FreeClient(client);
-    delete[] ptr;
-    delete[] ptr_result;
+    delete loaded_exec;
+    delete ifrt_client;
+    // FreeClient(client);
+    // delete[] ptr;
+    // delete[] ptr_result;
 }
