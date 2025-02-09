@@ -35,6 +35,8 @@
 
 #include "xla/python/ifrt/hlo/hlo_program.h"
 
+#include "llvm/Support/ExtensibleRTTI.h"
+
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -356,11 +358,11 @@ extern "C" xla::ifrt::LoadedExecutable* IFRTPJRT_ClientCompile(ifrt::PjRtClient*
 
 extern "C" void FreeLoadedExecutableIFRTPJRT(xla::ifrt::PjRtLoadedExecutable* exec) { delete exec; }
 
-extern "C" Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* ArrayFromHostBufferIFRTPJRT(ifrt::PjRtClient* client, Holded<std::shared_ptr<xla::PjRtBuffer>>* buffer) {
-  return reactant::capture(MyValueOrThrow(xla::ifrt::PjRtArray::Create(client, buffer->obj())));
+extern "C" Holded<tsl::RCReference<xla::ifrt::Array>>* ArrayFromHostBufferIFRTPJRT(ifrt::PjRtClient* client, Holded<std::shared_ptr<xla::PjRtBuffer>>* buffer) {
+  return reactant::capture(tsl::RCReference<ifrt::Array>(MyValueOrThrow(xla::ifrt::PjRtArray::Create(client, buffer->obj()))));
 }
 
-extern "C" void reactant_release_ifrt_pjrt_array(Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* array) { delete array; }
+extern "C" void reactant_release_ifrt_array(Holded<tsl::RCReference<xla::ifrt::Array>>* array) { delete array; }
 
 extern "C" void IFRT_Execute(ifrt::LoadedExecutable* exec, int num_args, Holded<tsl::RCReference<ifrt::Array>>** op_args, uint8_t* is_arg_donatable, int num_results, Holded<tsl::RCReference<ifrt::Array>>** op_results, uint8_t *futures, PjRtFuture<>** status) {
   std::vector<tsl::RCReference<xla::ifrt::Array>> args;
@@ -394,8 +396,12 @@ extern "C" void IFRT_Execute(ifrt::LoadedExecutable* exec, int num_args, Holded<
 }
 
 // in principle, use ArrayCopySemantics::kAlwaysCopy (=0)
-extern "C" PjRtFuture<>* IFRT_Array_CopyToHostBuffer(Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* array, void* data, ifrt::ArrayCopySemantics semantics) {
-  (*array)->CopyToHostBuffer(data, std::nullopt, semantics);
+extern "C" PjRtFuture<>* IFRT_Array_CopyToHostBuffer(Holded<tsl::RCReference<xla::ifrt::Array>>* array, void* data, ifrt::ArrayCopySemantics semantics) {
+  return new PjRtFuture<>((*array)->CopyToHostBuffer(data, std::nullopt, semantics));
+}
+
+extern "C" void reactant_generic_llvm_rtti_root_dtor(llvm::RTTIRoot* root) {
+  delete root;
 }
 
 int main()
@@ -451,7 +457,7 @@ int main()
     auto buffer = ArrayFromHostBuffer(pjrt_client, ptr, prim_type, dim, shape, device);
 
     Holded<std::shared_ptr<xla::PjRtBuffer>>* buffer_holded = reactant_hold_pjrtbuffer(buffer);
-    Holded<tsl::RCReference<xla::ifrt::PjRtArray>>* ifrt_input_array = ArrayFromHostBufferIFRTPJRT(ifrt_client, buffer_holded);
+    Holded<tsl::RCReference<xla::ifrt::Array>>* ifrt_input_array = ArrayFromHostBufferIFRTPJRT(ifrt_client, buffer_holded);
 
     // 6. execute computation
     // std::vector<tsl::RCReference<xla::ifrt::Array>> args;
@@ -474,8 +480,11 @@ int main()
 
     // 7. print results
     double *ptr_result = new double[16];
+
+    auto result = op_results[0];
     // BufferToHost(result.outputs[0]->pjrt_buffers()[0].get(), ptr_result);
-    (*op_results[0])->CopyToHostBuffer(ptr_result, std::nullopt, xla::ifrt::ArrayCopySemantics::kAlwaysCopy);
+    // (*result)->CopyToHostBuffer(ptr_result, std::nullopt, xla::ifrt::ArrayCopySemantics::kAlwaysCopy);
+    IFRT_Array_CopyToHostBuffer(result, ptr_result, xla::ifrt::ArrayCopySemantics::kAlwaysCopy);
 
     for (int i = 0; i < 16; i++)
     {
@@ -485,14 +494,19 @@ int main()
     // 8. free memory
     delete[] ptr;
     delete[] ptr_result;
+
+    reactant_release_ifrt_array(op_args[0]);
     delete[] op_args;
+
+    reactant_release_ifrt_array(op_results[0]);
     delete[] op_results;
+
     delete[] status;
 
     delete loaded_exec;
     delete ifrt_client;
 
-    reactant_release_ifrt_pjrt_array(ifrt_input_array);
+    // reactant_release_ifrt_array(ifrt_input_array);
     reactant_release_pjrtbuffer(buffer_holded);
 
     // do not free buffer because it has already been freed on `reactant_release_pjrtbuffer`
