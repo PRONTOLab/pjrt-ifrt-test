@@ -119,9 +119,9 @@ cc_binary(
 )
 
 cc_binary(
-    name = "demo-ifrt",
+    name = "demo-ifrt-pjrt",
     srcs = [
-        "src/demo-ifrt.cpp",
+        "src/demo-ifrt-pjrt.cpp",
         "@enzyme_ad//src/enzyme_ad/jax:RegistryUtils.cpp",
         "@enzyme_ad//src/enzyme_ad/jax:gpu.cc",
         "@enzyme_ad//src/enzyme_ad/jax:cpu.cc",
